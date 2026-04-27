@@ -1,4 +1,4 @@
-# mobile-test-ai
+# sergei-mobile-test
 
 AI-driven self-healing mobile test agent for **iOS and Android**.
 
@@ -12,9 +12,32 @@ mobile-test replay login_flow   # fast replay, no AI needed
 
 ---
 
+## How self-learning works
+
+The agent builds a library of tested flows called **skills**. No ML training involved — it learns at the behavior level.
+
+```
+First run:  AI sees screen → figures out steps → executes → saves as skill
+Next run:   replay skill instantly (no AI, no API cost, ~3s)
+UI changed: smart mode detects failure → AI re-learns → saves updated skill
+```
+
+**Three modes:**
+
+| Command | What happens | Speed |
+|---|---|---|
+| `run "goal"` | AI sees screen, decides each action | ~15–30s |
+| `run "goal" --save NAME` | Same, but saves successful path as skill | ~15–30s (once) |
+| `replay NAME` | Replays saved steps without AI | ~3s |
+| `smart NAME "goal"` | Tries replay → if broken, re-learns automatically | ~3s or ~30s |
+
+Over time, your skill library grows. Regression testing becomes fast and free — no AI calls until the UI actually changes.
+
+---
+
 ## Why not Maestro?
 
-| | Maestro | mobile-test-ai |
+| | Maestro | sergei-mobile-test |
 |---|---|---|
 | UI changed after redesign | Breaks permanently | Self-heals automatically |
 | Write a new test | Hand-write YAML | `run "do this"` |
@@ -22,6 +45,7 @@ mobile-test replay login_flow   # fast replay, no AI needed
 | Replay cached flow | ~5s | ~3s (no AI) |
 | Run new test | n/a | ~15–30s |
 | iOS 18 support | Needs maintenance | Works |
+| Android support | Separate tool | Same CLI |
 
 ---
 
