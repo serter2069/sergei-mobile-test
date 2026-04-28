@@ -28,8 +28,9 @@ SKILLS_DIR.mkdir(parents=True, exist_ok=True)
 IDB_PATH = os.environ.get("IDB_PATH", shutil.which("idb") or "idb")
 ADB_PATH = os.environ.get("ADB_PATH", shutil.which("adb") or "adb")
 
-PLATFORM       = "ios"
-ANDROID_SERIAL = None
+PLATFORM          = "ios"
+ANDROID_SERIAL    = None
+_ANDROID_LOGICAL_H = 896   # updated on each screenshot to match actual aspect ratio
 
 client    = None
 VLM_MODEL = None
@@ -39,6 +40,19 @@ def set_platform(platform: str, serial: str = None):
     global PLATFORM, ANDROID_SERIAL
     PLATFORM = platform
     ANDROID_SERIAL = serial
+
+
+def _action_delay(action_type: str):
+    """Wait for UI to settle after an action."""
+    import time
+    delays = {
+        "tap":        1.2,   # button press + possible screen transition
+        "type":       0.5,   # keyboard input
+        "swipe":      0.8,   # scroll animation
+        "press_home": 1.5,   # home screen animation
+        "press_back": 1.0,
+    }
+    time.sleep(delays.get(action_type, 0.8))
 
 
 # ─── AI client ──────────────────────────────────────────────────────────────
@@ -216,6 +230,7 @@ def android_screen_size() -> tuple[int, int]:
 
 
 def _android_screenshot() -> str:
+    global _ANDROID_LOGICAL_H
     raw = adb(["exec-out", "screencap", "-p"], binary=True)
     if not raw or len(raw) < 100:
         raise RuntimeError("adb screencap returned empty data — is device connected?")
@@ -225,6 +240,7 @@ def _android_screenshot() -> str:
     w, h = img.size
     target_w = 414
     target_h = int(h * target_w / w)
+    _ANDROID_LOGICAL_H = target_h          # store actual height for coordinate scaling
     img = img.resize((target_w, target_h), PILImage.LANCZOS)
     buf = io.BytesIO()
     img.save(buf, "PNG")
@@ -240,26 +256,58 @@ def screenshot() -> str:
     return _ios_screenshot()
 
 
+def _android_scale() -> tuple[float, float]:
+    """Scale factors from logical (414×_ANDROID_LOGICAL_H) → physical pixels."""
+    sw, sh = android_screen_size()
+    return sw / 414, sh / _ANDROID_LOGICAL_H
+
+
 def tap(x: int, y: int):
     if PLATFORM == "android":
-        sw, sh = android_screen_size()
-        adb(["shell", "input", "tap", str(int(x * sw / 414)), str(int(y * sh / 896))])
+        sx, sy = _android_scale()
+        adb(["shell", "input", "tap", str(int(x * sx)), str(int(y * sy))])
     else:
         idb(["ui", "tap", str(x), str(y)])
 
 
 def type_text(text: str):
     if PLATFORM == "android":
-        escaped = text.replace("\\", "\\\\").replace(" ", "%s").replace("'", "\\'")
-        adb(["shell", "input", "text", escaped])
+        # adb shell input text can't handle most special chars — use clipboard paste instead
+        _android_type_safe(text)
     else:
         idb(["ui", "text", text])
 
 
+def _android_type_safe(text: str):
+    """
+    Type text on Android without special-char escaping issues.
+    Uses ADB key events for ASCII, clipboard for complex text.
+    """
+    # Simple ASCII with no shell-special chars: use input text directly
+    safe_chars = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789")
+    if all(c in safe_chars or c == ' ' for c in text):
+        escaped = text.replace(" ", "%s")
+        adb(["shell", "input", "text", escaped])
+        return
+
+    # Complex text: push to clipboard via content provider, then paste
+    # Works on Android 7+ without root
+    import subprocess as _sp
+    _sp.run(
+        [ADB_PATH] + (["-s", ANDROID_SERIAL] if ANDROID_SERIAL else []) +
+        ["shell", "am", "broadcast", "-a", "clipper.set", "-e", "text", text],
+        capture_output=True, timeout=10
+    )
+    # If clipper not available, fall back to char-by-char with escaping
+    import time
+    time.sleep(0.3)
+    # Try paste (Ctrl+V via key events: 279 = KEYCODE_PASTE)
+    adb(["shell", "input", "keyevent", "279"])
+
+
 def swipe(x1: int, y1: int, x2: int, y2: int, duration: float = 0.3):
     if PLATFORM == "android":
-        sw, sh = android_screen_size()
-        sx, sy = sw / 414, sh / 896
+        sx, sy = _android_scale()
         ms = int(duration * 1000)
         adb(["shell", "input", "swipe",
              str(int(x1 * sx)), str(int(y1 * sy)),
@@ -419,9 +467,10 @@ def execute_action(action: dict):
     elif a == "press_back":
         press_back()
     elif a in ("done", "failed"):
-        pass
+        return
     else:
         raise ValueError(f"Unknown action: {a}")
+    _action_delay(a)
 
 
 # ─── Skills system ──────────────────────────────────────────────────────────
