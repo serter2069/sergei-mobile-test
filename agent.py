@@ -35,6 +35,14 @@ _ANDROID_LOGICAL_H = 896   # updated on each screenshot to match actual aspect r
 client    = None
 VLM_MODEL = None
 
+# When MOBILE_TEST_MODEL=claude-* the Anthropic SDK is used directly.
+# Set ANTHROPIC_API_KEY (already in env when running via Claude Code).
+# Alternatively set MOBILE_TEST_MODEL=claude-haiku-4-5-20251001
+_CLAUDE_MODE = False
+
+# Path where every screenshot is also saved as a file (for agent vision via Read)
+SCREENSHOT_PATH = os.environ.get("MOBILE_SCREENSHOT_PATH", "/tmp/phone_screen.png")
+
 
 def set_platform(platform: str, serial: str = None):
     global PLATFORM, ANDROID_SERIAL
@@ -61,40 +69,43 @@ def init_ai_client():
     """
     Configure AI client from environment variables.
 
-    Required env vars:
-      MOBILE_TEST_BASE   OpenAI-compatible API base URL
-      MOBILE_TEST_KEY    API key
-      MOBILE_TEST_MODEL  Model name (must support vision)
+    Claude mode (no external key needed — uses ANTHROPIC_API_KEY from env):
+      MOBILE_TEST_MODEL=claude-haiku-4-5-20251001
 
-    Example with OpenRouter:
+    OpenAI-compatible (OpenRouter, Ollama, NVIDIA NIM, etc.):
       MOBILE_TEST_BASE=https://openrouter.ai/api/v1
       MOBILE_TEST_KEY=sk-or-v1-...
       MOBILE_TEST_MODEL=openai/gpt-4o
-
-    Example with Ollama (local):
-      MOBILE_TEST_BASE=http://localhost:11434/v1
-      MOBILE_TEST_KEY=ollama
-      MOBILE_TEST_MODEL=llava:latest
     """
-    global client, VLM_MODEL
+    global client, VLM_MODEL, _CLAUDE_MODE
     if client is not None:
         return
 
+    model = os.environ.get("MOBILE_TEST_MODEL", "")
+
+    if model.startswith("claude-") or model == "claude":
+        import anthropic
+        api_key = os.environ.get("ANTHROPIC_API_KEY", "")
+        if not api_key:
+            raise RuntimeError("Set ANTHROPIC_API_KEY to use Claude as vision model.")
+        actual_model = model if model != "claude" else "claude-haiku-4-5-20251001"
+        client    = anthropic.Anthropic(api_key=api_key)
+        VLM_MODEL = actual_model
+        _CLAUDE_MODE = True
+        print(f"[ai] {actual_model} (Anthropic SDK)")
+        return
+
     from openai import OpenAI
-
-    base  = os.environ.get("MOBILE_TEST_BASE")
-    key   = os.environ.get("MOBILE_TEST_KEY")
-    model = os.environ.get("MOBILE_TEST_MODEL")
-
+    base = os.environ.get("MOBILE_TEST_BASE")
+    key  = os.environ.get("MOBILE_TEST_KEY")
     if not base or not key or not model:
         raise RuntimeError(
-            "Set MOBILE_TEST_BASE, MOBILE_TEST_KEY, MOBILE_TEST_MODEL env vars.\n"
+            "Set MOBILE_TEST_MODEL to a claude-* model (uses ANTHROPIC_API_KEY), or\n"
+            "set MOBILE_TEST_BASE + MOBILE_TEST_KEY + MOBILE_TEST_MODEL for OpenAI-compatible.\n"
             "Example:\n"
-            "  export MOBILE_TEST_BASE=https://openrouter.ai/api/v1\n"
-            "  export MOBILE_TEST_KEY=sk-or-v1-...\n"
-            "  export MOBILE_TEST_MODEL=openai/gpt-4o"
+            "  export MOBILE_TEST_MODEL=claude-haiku-4-5-20251001\n"
+            "  export ANTHROPIC_API_KEY=sk-ant-..."
         )
-
     client    = OpenAI(base_url=base, api_key=key)
     VLM_MODEL = model
     print(f"[ai] {model} via {base}")
@@ -189,7 +200,24 @@ def _ios_screenshot() -> str:
             "See docs/setup-ios.md for auto-start setup."
         )
     data = asyncio.run(_dvt_screenshot_async())
-    return base64.b64encode(data).decode()
+    # Resize to 414px wide (matches logical coordinate space, keeps VLM payload small)
+    try:
+        from PIL import Image as PILImage
+        import io
+        img = PILImage.open(io.BytesIO(data))
+        w, h = img.size
+        target_w = 414
+        target_h = int(h * target_w / w)
+        img = img.resize((target_w, target_h), PILImage.LANCZOS)
+        buf = io.BytesIO()
+        img.save(buf, "PNG")
+        png_bytes = buf.getvalue()
+        # Always save to disk — lets Claude agents Read the file directly
+        Path(SCREENSHOT_PATH).write_bytes(png_bytes)
+        return base64.b64encode(png_bytes).decode()
+    except ImportError:
+        Path(SCREENSHOT_PATH).write_bytes(data)
+        return base64.b64encode(data).decode()
 
 
 # ─── Android transport (adb) ─────────────────────────────────────────────────
@@ -262,10 +290,39 @@ def _android_scale() -> tuple[float, float]:
     return sw / 414, sh / _ANDROID_LOGICAL_H
 
 
+_MAESTRO_PORT = int(os.environ.get("MAESTRO_DRIVER_PORT", "7001"))
+
+
+def _maestro(path: str, payload: dict, timeout: int = 10):
+    """Send command to Maestro iOS driver HTTP server (port 7001)."""
+    import urllib.request, json as _json
+    data = _json.dumps(payload).encode()
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{_MAESTRO_PORT}/{path}",
+        data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as resp:
+            return resp.status == 200
+    except Exception as e:
+        raise RuntimeError(f"Maestro driver error ({path}): {e}")
+
+
+def _maestro_available() -> bool:
+    try:
+        import urllib.request
+        urllib.request.urlopen(f"http://127.0.0.1:{_MAESTRO_PORT}/status", timeout=1)
+        return True
+    except Exception:
+        return False
+
+
 def tap(x: int, y: int):
     if PLATFORM == "android":
         sx, sy = _android_scale()
         adb(["shell", "input", "tap", str(int(x * sx)), str(int(y * sy))])
+    elif _maestro_available():
+        _maestro("touch", {"x": float(x), "y": float(y)})
     else:
         idb(["ui", "tap", str(x), str(y)])
 
@@ -274,6 +331,8 @@ def type_text(text: str):
     if PLATFORM == "android":
         # adb shell input text can't handle most special chars — use clipboard paste instead
         _android_type_safe(text)
+    elif _maestro_available():
+        _maestro("inputText", {"text": text, "appIds": []})
     else:
         idb(["ui", "text", text])
 
@@ -312,6 +371,12 @@ def swipe(x1: int, y1: int, x2: int, y2: int, duration: float = 0.3):
         adb(["shell", "input", "swipe",
              str(int(x1 * sx)), str(int(y1 * sy)),
              str(int(x2 * sx)), str(int(y2 * sy)), str(ms)])
+    elif _maestro_available():
+        _maestro("swipe", {
+            "startX": float(x1), "startY": float(y1),
+            "endX": float(x2), "endY": float(y2),
+            "duration": float(duration)  # seconds
+        })
     else:
         idb(["ui", "swipe",
              "--x", str(x1), "--y", str(y1),
@@ -322,6 +387,8 @@ def swipe(x1: int, y1: int, x2: int, y2: int, duration: float = 0.3):
 def press_home():
     if PLATFORM == "android":
         adb(["shell", "input", "keyevent", "3"])
+    elif _maestro_available():
+        _maestro("pressButton", {"button": "home"})
     else:
         idb(["ui", "key", "--key", "HOME"])
 
@@ -403,11 +470,31 @@ Coordinates are iPhone logical points (414×896)."""
 
 
 def _parse_action(text: str) -> dict:
-    if text.startswith("```"):
-        text = text.split("```")[1]
-        if text.startswith("json"):
-            text = text[4:]
-    return json.loads(text.strip())
+    import re
+    # Strip markdown code fences
+    if "```" in text:
+        parts = text.split("```")
+        for part in parts:
+            part = part.lstrip("json").strip()
+            if part.startswith("{"):
+                text = part
+                break
+    text = text.strip()
+    if not text:
+        return {"action": "failed", "reason": "VLM returned empty response"}
+    # If not valid JSON directly, try to extract first {...} block
+    if not text.startswith("{"):
+        m = re.search(r'\{[^{}]+\}', text, re.DOTALL)
+        if m:
+            text = m.group(0)
+        else:
+            return {"action": "failed", "reason": f"VLM returned non-JSON: {text[:80]}"}
+    action = json.loads(text)
+    # Normalize coordinates: some models return 0-1 floats instead of pixel ints
+    for key in ("x", "y", "x1", "y1", "x2", "y2"):
+        if key in action and isinstance(action[key], float) and action[key] <= 1.0:
+            action[key] = int(action[key] * (896 if "y" in key else 414))
+    return action
 
 
 def ask_vlm(goal: str, screenshot_b64: str, history: list) -> dict:
@@ -418,12 +505,31 @@ def ask_vlm(goal: str, screenshot_b64: str, history: list) -> dict:
             history_text = "\n\nPrevious actions:\n" + "\n".join(
                 f"- {h['action']}: {h.get('reason', '')}" for h in recent
             )
+    prompt = f"GOAL: {goal}{history_text}\n\nNext action?"
+
+    if _CLAUDE_MODE:
+        # Anthropic SDK — native multimodal, no external endpoint needed
+        import anthropic
+        response = client.messages.create(
+            model=VLM_MODEL,
+            max_tokens=300,
+            system=_build_system_prompt(),
+            messages=[{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64", "media_type": "image/png", "data": screenshot_b64
+                }},
+                {"type": "text", "text": prompt},
+            ]}]
+        )
+        return _parse_action(response.content[0].text.strip())
+
+    # OpenAI-compatible (OpenRouter, Ollama, NVIDIA NIM, etc.)
     messages = [
         {"role": "system", "content": _build_system_prompt()},
         {"role": "user", "content": [
-            {"type": "text", "text": f"GOAL: {goal}{history_text}\n\nNext action?"},
+            {"type": "text", "text": prompt},
             {"type": "image_url",
-             "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "high"}}
+             "image_url": {"url": f"data:image/png;base64,{screenshot_b64}", "detail": "low"}}
         ]}
     ]
     response = client.chat.completions.create(
